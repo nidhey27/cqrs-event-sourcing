@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package protobuf;
+option go_package = "./account_command";
+
+message WithdrawRequest {
+    string  account_no  = 1;
+    float   amount      = 2;
+}
+
+message WithdrawResponse {
+    string  message = 1;
+    float   balance = 2;
+}
+
+message DespositeRequst {
+    string  account_no  = 1;
+    float   amount      = 2;
+}
+
+message DepositeResponse {
+    string  message = 1;
+    float   balance = 2;
+}
+
+message TransferRequest {
+    string  account_from    = 1;
+    string  account_tp      = 2;
+    float   amount          = 3;
+}
+
+message TransferResponse {
+    string  message = 1;
+    float   balance = 2;
+}
+
+service AccountCommandService {
+    rpc Withdraw(WithdrawRequest) returns (WithdrawResponse);
+    rpc Deposite(DespositeRequst) returns (DepositeResponse);
+    rpc Transfer(TransferRequest) returns (TransferResponse);
+}

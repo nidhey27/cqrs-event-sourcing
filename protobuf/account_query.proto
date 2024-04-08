@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package protobuf;
+option go_package = "./account_query";
+
+message BalanceRequest {
+    string  account_no  = 1;
+}
+
+message BalanceResponse {
+    string  message = 1;
+    float   balance = 2;
+}
+
+service AccountQueryService {
+    rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+}
