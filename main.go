@@ -5,31 +5,39 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/nidhey27/cqrs-go/activities"
 	"github.com/nidhey27/cqrs-go/ent"
 	"github.com/nidhey27/cqrs-go/ent/account"
-	"github.com/nidhey27/cqrs-go/ent/transaction"
 	"github.com/nidhey27/cqrs-go/protobuf/account_command"
 	"github.com/nidhey27/cqrs-go/protobuf/account_query"
+	"github.com/nidhey27/cqrs-go/workflows"
+	temporal_client "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
 
 type AccountCommandService struct {
-	dbClient *ent.Client
+	dbClient       *ent.Client
+	temporalClient temporal_client.Client
 	account_command.UnimplementedAccountCommandServiceServer
 }
 
 type AccountQueryService struct {
-	dbClient *ent.Client
+	dbClient       *ent.Client
+	temporalClient temporal_client.Client
 	account_query.UnimplementedAccountQueryServiceServer
 }
 
 func main() {
-
+	// DB Setup START
 	client, err := ent.Open("postgres", "host=localhost port=5433 user=nidhey dbname=bank password=password sslmode=disable")
 	if err != nil {
 		log.Fatalf("failed opening connection to sqlite: %v", err)
@@ -39,6 +47,21 @@ func main() {
 	if err := client.Schema.Create(context.Background()); err != nil {
 		log.Fatalf("failed creating schema resources: %v", err)
 	}
+	// DB Setup END
+	//
+	// Temporal Client START
+	c, err := temporal_client.Dial(temporal_client.Options{})
+	if err != nil {
+		log.Fatalln("unable to create Temporal client", err)
+	}
+	defer c.Close()
+
+	w := worker.New(c, "account_balance", worker.Options{})
+	w.RegisterWorkflow(workflows.CalculateBalance)
+	w.RegisterActivity(activities.GetTransactions)
+	w.RegisterActivity(activities.GetBalance)
+	w.RegisterActivity(activities.SetBalance)
+	// Temporal Client END
 
 	listener, err := net.Listen("tcp", ":9000")
 	if err != nil {
@@ -48,17 +71,32 @@ func main() {
 	server := grpc.NewServer()
 
 	account_command.RegisterAccountCommandServiceServer(server, &AccountCommandService{
-		dbClient: client,
+		dbClient:       client,
+		temporalClient: c,
 	})
 	account_query.RegisterAccountQueryServiceServer(server, &AccountQueryService{
-		dbClient: client,
+		dbClient:       client,
+		temporalClient: c,
 	})
 
 	reflection.Register(server)
+
+	// Start the worker & gRPC Server
 	log.Println("Server started at PORT 💻: 9000")
-	if err := server.Serve(listener); err != nil {
-		panic(err)
-	}
+	go w.Run(worker.InterruptCh())
+	go func() {
+		if err := server.Serve(listener); err != nil {
+			panic(err)
+		}
+	}()
+
+	// Listen for termination signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for termination signal
+	<-stop
+	w.Stop()
 }
 
 func (acs *AccountCommandService) Withdraw(ctx context.Context, req *account_command.WithdrawRequest) (*account_command.WithdrawResponse, error) {
@@ -79,24 +117,13 @@ func (acs *AccountCommandService) Withdraw(ctx context.Context, req *account_com
 	}
 
 	// Calculate Account Balance START
-	go func(acs *AccountCommandService, account_no string) {
-		ctx := context.Background()
-		log.Printf("Calculating balance of %v after withdrawal...", account_no)
-		balance, err := CalucateBalance(ctx, acs.dbClient, account_no)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		_, err = acs.dbClient.Account.Update().
-			SetAccountBalance(balance).
-			Where(account.AccountNumber(account_no)).Save(ctx)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		log.Printf("Account Balance Updated: %v:%v", account_no, balance)
-	}(acs, req.AccountNo)
+	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
+		ID:        "account_workflow",
+		TaskQueue: "account",
+	}, workflows.CalculateBalance, req.AccountNo)
+	if err != nil {
+		log.Printf("Unable to process request for %v:%v", req.AccountNo, err)
+	}
 	// Calculate Account Balance END
 
 	return &account_command.WithdrawResponse{
@@ -123,24 +150,13 @@ func (acs *AccountCommandService) Deposite(ctx context.Context, req *account_com
 	}
 
 	// Calculate Account Balance START
-	go func(acs *AccountCommandService, account_no string) {
-		ctx := context.Background()
-		log.Printf("Calculating balance of %v after deposit...", account_no)
-		balance, err := CalucateBalance(ctx, acs.dbClient, account_no)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		_, err = acs.dbClient.Account.Update().
-			SetAccountBalance(balance).
-			Where(account.AccountNumber(account_no)).Save(ctx)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		log.Printf("Account Balance Updated: %v:%v", account_no, balance)
-	}(acs, req.AccountNo)
+	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
+		ID:        "account_workflow",
+		TaskQueue: "account",
+	}, workflows.CalculateBalance, req.AccountNo)
+	if err != nil {
+		log.Printf("Unable to process request for %v:%v", req.AccountNo, err)
+	}
 	// Calculate Account Balance END
 
 	return &account_command.DepositeResponse{
@@ -169,24 +185,13 @@ func (acs *AccountCommandService) Transfer(ctx context.Context, req *account_com
 	}
 
 	// Calculate Account Balance START
-	go func(acs *AccountCommandService, account_no string) {
-		ctx := context.Background()
-		log.Printf("Calculating balance of %v after withdrawal...", account_no)
-		balance, err := CalucateBalance(ctx, acs.dbClient, account_no)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		_, err = acs.dbClient.Account.Update().
-			SetAccountBalance(balance).
-			Where(account.AccountNumber(account_no)).Save(ctx)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		log.Printf("Account Balance Updated: %v:%v", account_no, balance)
-	}(acs, req.AccountFrom)
+	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
+		ID:        "account_workflow",
+		TaskQueue: "account",
+	}, workflows.CalculateBalance, req.AccountFrom)
+	if err != nil {
+		log.Printf("Unable to process request for %v:%v", req.AccountFrom, err)
+	}
 	// Calculate Account Balance END
 
 	// Credit to "To account"
@@ -206,45 +211,18 @@ func (acs *AccountCommandService) Transfer(ctx context.Context, req *account_com
 	}
 
 	// Calculate Account Balance START
-	go func(acs *AccountCommandService, account_no string) {
-		ctx := context.Background()
-		log.Printf("Calculating balance of %v after deposit...", account_no)
-		balance, err := CalucateBalance(ctx, acs.dbClient, account_no)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		_, err = acs.dbClient.Account.Update().
-			SetAccountBalance(balance).
-			Where(account.AccountNumber(account_no)).Save(ctx)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		log.Printf("Account Balance Updated: %v:%v", account_no, balance)
-	}(acs, req.AccountTp)
+	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
+		ID:        "account_workflow",
+		TaskQueue: "account",
+	}, workflows.CalculateBalance, req.AccountTp)
+	if err != nil {
+		log.Printf("Unable to process request for %v:%v", req.AccountTp, err)
+	}
 	// Calculate Account Balance END
 
 	return &account_command.TransferResponse{
 		Message: fmt.Sprintf("INR %v transfered from %v to %v", req.Amount, req.AccountFrom, req.AccountTp),
 	}, nil
-}
-
-func CalucateBalance(ctx context.Context, dbClient *ent.Client, accountNo string) (float64, error) {
-	transactions := dbClient.Transaction.Query().
-		Where(transaction.AccountNumber(accountNo)).AllX(ctx)
-	var balance float64 = 0
-	for _, tx := range transactions {
-		switch tx.Type {
-		case "credit":
-			balance += tx.Amount
-		case "debit":
-			balance -= tx.Amount
-		}
-	}
-
-	return balance, nil
 }
 
 func (aqs *AccountQueryService) GetBalance(ctx context.Context, req *account_query.BalanceRequest) (*account_query.BalanceResponse, error) {
