@@ -100,31 +100,40 @@ func main() {
 }
 
 func (acs *AccountCommandService) Withdraw(ctx context.Context, req *account_command.WithdrawRequest) (*account_command.WithdrawResponse, error) {
+	// Start a database transaction
+	tx, err := acs.dbClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			log.Printf("recovered panic: %v", p)
+		} else if err != nil {
+			tx.Rollback()
+			log.Printf("rolling back transaction due to error: %v", err)
+		}
+	}()
+
 	txn_id := uuid.New()
 
-	_, err := acs.dbClient.Transaction.Create().
-		SetTransactionID(txn_id.String()).
-		SetAccountNumber(req.AccountNo).
-		SetAmount(float64(req.Amount)).
-		SetType("debit").
-		SetTimestamp(time.Now()).
-		Save(ctx)
-	if err != nil {
+	// Debit from account
+	if _, err := acs.debit(ctx, txn_id.String(), req.AccountNo, float64(req.Amount)); err != nil {
 		log.Fatalf("failed to withdraw amount: %v", err)
 		return &account_command.WithdrawResponse{
 			Message: "Something went wrong! Please try again",
 		}, err
 	}
 
-	// Calculate Account Balance START
-	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
-		ID:        "account_workflow",
-		TaskQueue: "account",
-	}, workflows.CalculateBalance, req.AccountNo)
-	if err != nil {
-		log.Printf("Unable to process request for %v:%v", req.AccountNo, err)
+	// Calculate Account Balance
+	if err := acs.calculateBalance(ctx, "account_workflow_debit", req.AccountNo); err != nil {
+		return nil, err
 	}
-	// Calculate Account Balance END
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
 
 	return &account_command.WithdrawResponse{
 		Message: "Withdrawal Successful!",
@@ -133,31 +142,40 @@ func (acs *AccountCommandService) Withdraw(ctx context.Context, req *account_com
 }
 
 func (acs *AccountCommandService) Deposite(ctx context.Context, req *account_command.DespositeRequst) (*account_command.DepositeResponse, error) {
+	// Start a database transaction
+	tx, err := acs.dbClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			log.Printf("recovered panic: %v", p)
+		} else if err != nil {
+			tx.Rollback()
+			log.Printf("rolling back transaction due to error: %v", err)
+		}
+	}()
+
 	txn_id := uuid.New()
 
-	_, err := acs.dbClient.Transaction.Create().
-		SetTransactionID(txn_id.String()).
-		SetAccountNumber(req.AccountNo).
-		SetAmount(float64(req.Amount)).
-		SetType("credit").
-		SetTimestamp(time.Now()).
-		Save(ctx)
-	if err != nil {
+	// Credit to account
+	if _, err := acs.credit(ctx, txn_id.String(), req.AccountNo, float64(req.Amount)); err != nil {
 		log.Fatalf("failed to deposit amount: %v", err)
 		return &account_command.DepositeResponse{
 			Message: "Something went wrong! Please try again",
 		}, err
 	}
 
-	// Calculate Account Balance START
-	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
-		ID:        "account_workflow",
-		TaskQueue: "account",
-	}, workflows.CalculateBalance, req.AccountNo)
-	if err != nil {
-		log.Printf("Unable to process request for %v:%v", req.AccountNo, err)
+	// Calculate Account Balance
+	if err := acs.calculateBalance(ctx, "account_workflow_credit", req.AccountNo); err != nil {
+		return nil, err
 	}
-	// Calculate Account Balance END
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
 
 	return &account_command.DepositeResponse{
 		Message: "Deposit Successful!",
@@ -166,63 +184,102 @@ func (acs *AccountCommandService) Deposite(ctx context.Context, req *account_com
 }
 
 func (acs *AccountCommandService) Transfer(ctx context.Context, req *account_command.TransferRequest) (*account_command.TransferResponse, error) {
-	// Debit from "FROM account"
-	txn_id := uuid.New()
-
-	_, err := acs.dbClient.Transaction.Create().
-		SetTransactionID(txn_id.String()).
-		SetAccountNumber(req.AccountFrom).
-		SetAmount(float64(req.Amount)).
-		SetType("debit").
-		SetTimestamp(time.Now()).
-		Save(ctx)
+	// Start a database transaction
+	tx, err := acs.dbClient.BeginTx(ctx, nil)
 
 	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			log.Printf("recovered panic: %v", p)
+		} else if err != nil {
+			tx.Rollback()
+			log.Printf("rolling back transaction due to error: %v", err)
+		}
+	}()
+	txn_id := uuid.New()
+
+	// Debit from "FROM account"
+	if _, err := acs.debit(ctx, txn_id.String(), req.AccountFrom, float64(req.Amount)); err != nil {
 		log.Fatalf("failed to transfer(debit) amount: %v", err)
 		return &account_command.TransferResponse{
 			Message: "Something went wrong! Please try again",
 		}, err
 	}
 
-	// Calculate Account Balance START
-	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
-		ID:        "account_workflow",
-		TaskQueue: "account",
-	}, workflows.CalculateBalance, req.AccountFrom)
-	if err != nil {
-		log.Printf("Unable to process request for %v:%v", req.AccountFrom, err)
+	// Calculate Account Balance
+	if err := acs.calculateBalance(ctx, "account_workflow_debit", req.AccountFrom); err != nil {
+		return nil, err
 	}
-	// Calculate Account Balance END
 
-	// Credit to "To account"
-	_, err = acs.dbClient.Transaction.Create().
-		SetTransactionID(txn_id.String()).
-		SetAccountNumber(req.AccountTp).
-		SetAmount(float64(req.Amount)).
-		SetType("credit").
-		SetTimestamp(time.Now()).
-		Save(ctx)
-
-	if err != nil {
+	// Credit to "TO account"
+	if _, err := acs.credit(ctx, txn_id.String(), req.AccountTp, float64(req.Amount)); err != nil {
 		log.Fatalf("failed to transfer(credit) amount: %v", err)
 		return &account_command.TransferResponse{
 			Message: "Something went wrong! Please try again",
 		}, err
 	}
 
-	// Calculate Account Balance START
-	_, err = acs.temporalClient.ExecuteWorkflow(context.Background(), temporal_client.StartWorkflowOptions{
-		ID:        "account_workflow",
-		TaskQueue: "account",
-	}, workflows.CalculateBalance, req.AccountTp)
-	if err != nil {
-		log.Printf("Unable to process request for %v:%v", req.AccountTp, err)
+	// Calculate Account Balance
+	if err := acs.calculateBalance(ctx, "account_workflow_credit", req.AccountTp); err != nil {
+		return nil, err
 	}
-	// Calculate Account Balance END
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
 
 	return &account_command.TransferResponse{
 		Message: fmt.Sprintf("INR %v transfered from %v to %v", req.Amount, req.AccountFrom, req.AccountTp),
 	}, nil
+}
+
+func (acs *AccountCommandService) debit(ctx context.Context, txnID, accountNumber string, amount float64) (*ent.Transaction, error) {
+	// Debit from account
+	transaction, err := acs.dbClient.Transaction.Create().
+		SetTransactionID(txnID).
+		SetAccountNumber(accountNumber).
+		SetAmount(amount). // negative amount indicates a debit
+		SetType("debit").
+		SetTimestamp(time.Now()).
+		Save(ctx)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to debit amount: %v", err)
+	}
+	return transaction, nil
+}
+
+func (acs *AccountCommandService) credit(ctx context.Context, txnID, accountNumber string, amount float64) (*ent.Transaction, error) {
+	// Credit to account
+	transaction, err := acs.dbClient.Transaction.Create().
+		SetTransactionID(txnID).
+		SetAccountNumber(accountNumber).
+		SetAmount(amount).
+		SetType("credit").
+		SetTimestamp(time.Now()).
+		Save(ctx)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to credit amount: %v", err)
+	}
+	return transaction, nil
+}
+
+func (acs *AccountCommandService) calculateBalance(ctx context.Context, workflowID string, accountNumber string) error {
+	// Calculate Account Balance
+	_, err := acs.temporalClient.ExecuteWorkflow(ctx, temporal_client.StartWorkflowOptions{
+		ID:        workflowID,
+		TaskQueue: "account",
+	}, workflows.CalculateBalance, accountNumber)
+	if err != nil {
+		return fmt.Errorf("unable to process request for %v: %v", accountNumber, err)
+	}
+	return nil
 }
 
 func (aqs *AccountQueryService) GetBalance(ctx context.Context, req *account_query.BalanceRequest) (*account_query.BalanceResponse, error) {
